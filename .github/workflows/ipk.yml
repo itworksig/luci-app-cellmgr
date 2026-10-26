@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - VERSION
+      - scripts/pack-ipk.sh
+      - .github/workflows/ipk.yml
   workflow_dispatch:
 
 permissions:
@@ -67,11 +69,7 @@ jobs:
           IPK_NAME: ${{ steps.ver.outputs.ipk }}
         run: |
           IPK="dist/${IPK_NAME}"
-          NOTES="luci-app-cellmgr v${VER}
-
-通用包：${IPK_NAME}
-
-opkg install ${IPK_NAME}"
+          NOTES="luci-app-cellmgr v${VER} / ${IPK_NAME}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$IPK" --clobber
           else
