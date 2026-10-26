@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-cellmgr
-PKG_VERSION:=0.3.0
+PKG_VERSION:=$(shell cat $(CURDIR)/VERSION)
 PKG_RELEASE:=1
 
 LUCI_TITLE:=C2000-MAX cellular / eSIM manager

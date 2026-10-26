@@ -1,0 +1,79 @@
+name: Pack IPK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pack-ipk
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ipk=luci-app-cellmgr-v${VERSION}-all.ipk" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to pack
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "pack=true" >> "$GITHUB_OUTPUT"
+            echo "Manual run: pack ${TAG}"
+            exit 0
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "pack=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists, skip."
+          else
+            echo "pack=true" >> "$GITHUB_OUTPUT"
+            echo "New version ${TAG}, packing."
+          fi
+
+      - name: Build generic all.ipk
+        if: steps.gate.outputs.pack == 'true'
+        run: bash scripts/pack-ipk.sh
+
+      - name: Upload artifact
+        if: steps.gate.outputs.pack == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.ipk }}
+          path: dist/${{ steps.ver.outputs.ipk }}
+
+      - name: Publish GitHub Release
+        if: steps.gate.outputs.pack == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.version }}
+          IPK_NAME: ${{ steps.ver.outputs.ipk }}
+        run: |
+          IPK="dist/${IPK_NAME}"
+          NOTES="luci-app-cellmgr v${VER}
+
+通用包：${IPK_NAME}
+
+opkg install ${IPK_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$IPK" --clobber
+          else
+            gh release create "$TAG" "$IPK" --title "v${VER}" --notes "$NOTES"
+          fi

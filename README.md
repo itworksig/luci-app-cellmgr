@@ -3,7 +3,7 @@
 鲲鹏 / NRadio C2000-MAX（WT9303）蜂窝管理：TD Tech MT5700，两张内置 eSIM + 一张外置 nano SIM。
 
 LuCI：**网络 → 蜂窝模组**  
-版本：**0.3.0** · 许可证：MIT
+版本见 `VERSION` · 许可证：MIT
 
 ## 功能
 
@@ -14,16 +14,13 @@ LuCI：**网络 → 蜂窝模组**
 
 ## 安装
 
-把仓库里的 `root/` 和 `htdocs/` 同步到路由器对应路径：
+从 [Releases](https://github.com/itworksig/luci-app-cellmgr/releases) 下载 `luci-app-cellmgr-vX.Y.Z-all.ipk`：
 
 ```sh
-chmod +x /usr/sbin/cellmgr /usr/sbin/cellmgr-watch /etc/init.d/cellmgr
-/etc/init.d/cellmgr enable
-/etc/init.d/cellmgr start
-/etc/init.d/rpcd restart
+opkg install luci-app-cellmgr-v0.3.0-all.ipk
 ```
 
-刷新 LuCI 后打开 **网络 → 蜂窝模组**。
+把 `VERSION` 改掉并推到 `main`，GitHub Actions 会自动再打一包。
 
 ## 硬件
 
