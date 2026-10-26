@@ -1,0 +1,1366 @@
+#!/usr/bin/python3
+"""C2000-MAX MT5700 cellular helper: status, SIM slot, RAT, dial."""
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+PORT = "/dev/ttyUSB1"
+LOCK = "/var/lock/cellmgr.lock"
+GPIO_SEL = "/sys/class/gpio/cpe-sel0/value"
+GPIO_PWR = "/sys/class/gpio/cpe-pwr/value"
+NETDEV = "eth2"
+IFACE = "wwan"
+STATE = "/tmp/cellmgr-state.json"
+BUSY = "/var/run/cellmgr.busy"
+USAGE = "/etc/cellmgr-usage.json"
+LOG = "/tmp/cellmgr-events.json"
+
+SLOTS = {
+    "nano":  {"label": "外置 SIM", "gpio": "0", "scichg": ("0", "1")},
+    "esim1": {"label": "内置 eSIM 1", "gpio": "1", "scichg": ("0", "1")},
+    "esim2": {"label": "内置 eSIM 2", "gpio": "1", "scichg": ("1", "0")},
+}
+
+PLMN = {
+    "46000": "中国移动", "46002": "中国移动", "46004": "中国移动",
+    "46007": "中国移动", "46008": "中国移动",
+    "46001": "中国联通", "46006": "中国联通", "46009": "中国联通",
+    "46003": "中国电信", "46005": "中国电信", "46011": "中国电信",
+    "46015": "中国广电",
+}
+
+ACT = {
+    0: "GSM", 1: "GSM Compact", 2: "UMTS", 3: "EGPRS",
+    4: "HSDPA", 5: "HSUPA", 6: "HSPA", 7: "LTE",
+    8: "EC-GSM", 9: "NB-IoT", 10: "LTE-5GC", 11: "NR",
+    12: "NR", 13: "EN-DC",
+}
+
+
+def readfile(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def writefile(path, value):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(value))
+
+
+def load_state():
+    try:
+        with open(STATE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(data):
+    cur = load_state()
+    cur.update(data)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cur, fh)
+    os.replace(tmp, STATE)
+
+
+def _at_on_tty(tty, cmd, wait):
+    try:
+        os.read(tty, 16384)
+    except BlockingIOError:
+        pass
+    os.write(tty, (cmd + "\r").encode("ascii", "ignore"))
+    buf = b""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(0.03)
+        try:
+            buf += os.read(tty, 8192)
+        except BlockingIOError:
+            pass
+        text = buf.replace(b"\r", b"")
+        if b"\nOK" in text or b"\nERROR" in text or b"CME ERROR" in text:
+            time.sleep(0.04)
+            try:
+                buf += os.read(tty, 8192)
+            except BlockingIOError:
+                pass
+            break
+    return buf.decode("utf-8", "replace").replace("\r", "")
+
+
+def at_many(cmds, wait=1.6):
+    os.makedirs("/var/lock", exist_ok=True)
+    lockfd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(lockfd, fcntl.LOCK_EX)
+    out = {}
+    try:
+        tty = os.open(PORT, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            time.sleep(0.03)
+            for cmd in cmds:
+                out[cmd] = _at_on_tty(tty, cmd, wait)
+            return out
+        finally:
+            os.close(tty)
+    except OSError as exc:
+        err = "ERROR\n%s\n" % exc
+        for cmd in cmds:
+            out.setdefault(cmd, err)
+        return out
+    finally:
+        fcntl.flock(lockfd, fcntl.LOCK_UN)
+        os.close(lockfd)
+
+
+def at(cmd, wait=2.5):
+    return at_many([cmd], wait).get(cmd, "ERROR\n")
+
+
+def lines_of(resp):
+    return [ln.strip() for ln in resp.splitlines() if ln.strip()]
+
+
+def find_line(resp, prefix):
+    for ln in lines_of(resp):
+        if ln.startswith(prefix):
+            return ln
+    return ""
+
+
+def ok(resp):
+    return any(ln == "OK" for ln in lines_of(resp))
+
+
+def net_stats():
+    base = "/sys/class/net/%s/statistics" % NETDEV
+    return {
+        "rx_bytes": int(readfile(base + "/rx_bytes") or 0),
+        "tx_bytes": int(readfile(base + "/tx_bytes") or 0),
+        "rx_packets": int(readfile(base + "/rx_packets") or 0),
+        "tx_packets": int(readfile(base + "/tx_packets") or 0),
+        "ts": time.time(),
+    }
+
+
+def ifstatus():
+    try:
+        out = subprocess.check_output(["ifstatus", IFACE], stderr=subprocess.DEVNULL, text=True)
+        return json.loads(out)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return {}
+
+
+def detect_slot(gpio, scichg):
+    for key, spec in SLOTS.items():
+        if spec["gpio"] == gpio and spec["scichg"] == scichg:
+            return key
+    return "unknown"
+
+
+def parse_hcsq(raw):
+    # ^HCSQ: "NR",rsrp,sinr,rsrq   or "LTE",rssi,rsrp,sinr,rsrq
+    info = {"rat": "", "rssi_dbm": None, "rsrp_dbm": None, "rsrq_db": None, "sinr_db": None, "raw": raw}
+    if not raw:
+        return info
+    body = raw.split(":", 1)[-1].strip()
+    parts = [p.strip().strip('"') for p in body.split(",")]
+    if not parts:
+        return info
+    mode = parts[0].upper()
+    info["rat"] = mode
+    try:
+        nums = [int(x) for x in parts[1:] if x != ""]
+    except ValueError:
+        return info
+    if mode in ("NR", "NR5G", "NR-5GC"):
+        if len(nums) >= 1:
+            info["rsrp_dbm"] = nums[0] - 141
+        if len(nums) >= 2:
+            info["sinr_db"] = round(nums[1] / 5 - 20, 1)
+        if len(nums) >= 3:
+            info["rsrq_db"] = nums[2] - 40
+        info["rat"] = "NR"
+    elif mode == "LTE":
+        if len(nums) >= 1:
+            info["rssi_dbm"] = nums[0] - 121
+        if len(nums) >= 2:
+            info["rsrp_dbm"] = nums[1] - 141
+        if len(nums) >= 3:
+            info["sinr_db"] = round(nums[2] / 5 - 20, 1)
+        if len(nums) >= 4:
+            info["rsrq_db"] = (nums[3] - 40) / 2
+        info["rat"] = "LTE"
+    return info
+
+
+def bars_from_rsrp(rsrp):
+    if rsrp is None:
+        return 0
+    if rsrp >= -80:
+        return 5
+    if rsrp >= -90:
+        return 4
+    if rsrp >= -100:
+        return 3
+    if rsrp >= -110:
+        return 2
+    return 1
+
+
+def parse_cops(raw):
+    # +COPS: 0,0,"CHN-UNICOM",12
+    info = {"mode": None, "name": "", "plmn": "", "act": None, "act_name": "", "carrier": ""}
+    ln = find_line(raw, "+COPS:")
+    if not ln:
+        return info
+    body = ln.split(":", 1)[-1].strip()
+    parts = [p.strip() for p in body.split(",")]
+    if parts:
+        try:
+            info["mode"] = int(parts[0])
+        except ValueError:
+            pass
+    if len(parts) >= 3:
+        info["name"] = parts[2].strip('"')
+    if len(parts) >= 4:
+        try:
+            info["act"] = int(parts[3])
+            info["act_name"] = ACT.get(info["act"], "未知")
+        except ValueError:
+            pass
+    return info
+
+
+def parse_sysinfoex(raw):
+    ln = find_line(raw, "^SYSINFOEX:")
+    info = {"srv_status": None, "roam": None, "sysmode_name": "", "submode_name": ""}
+    if not ln:
+        return info
+    parts = [p.strip().strip('"') for p in ln.split(":", 1)[-1].split(",")]
+    try:
+        info["srv_status"] = int(parts[0])
+    except (ValueError, IndexError):
+        pass
+    try:
+        info["roam"] = int(parts[2])
+    except (ValueError, IndexError):
+        pass
+    if len(parts) >= 7:
+        info["sysmode_name"] = parts[6]
+    if len(parts) >= 9:
+        info["submode_name"] = parts[8]
+    return info
+
+
+def parse_hfreq(raw):
+    ln = find_line(raw, "^HFREQINFO:")
+    info = {"band": "", "band_num": None, "dl_mhz": None, "bw_mhz": None, "arfcn": "", "raw": ln}
+    if not ln:
+        return info
+    parts = [p.strip() for p in ln.split(":", 1)[-1].split(",")]
+    try:
+        # 0,7,78,630000,3450000,100000,...
+        band = int(parts[2])
+        dl = int(parts[4]) / 1000.0
+        bw = int(parts[5]) / 1000.0
+        rat = int(parts[1]) if parts[1] else 0
+        prefix = "n" if rat in (6, 7, 11, 12) or band >= 70 else "B"
+        info["band"] = "%s%s" % (prefix, band)
+        info["band_num"] = band
+        info["dl_mhz"] = dl
+        info["bw_mhz"] = bw
+        if len(parts) > 3 and parts[3]:
+            info["arfcn"] = parts[3]
+    except (ValueError, IndexError):
+        pass
+    return info
+
+
+def parse_scichg(raw):
+    ln = find_line(raw, "^SCICHG:")
+    if not ln:
+        return ("", "")
+    parts = [p.strip() for p in ln.split(":", 1)[-1].split(",")]
+    a = parts[0] if parts else ""
+    b = parts[1] if len(parts) > 1 else ""
+    return (a, b)
+
+
+def parse_csq(raw):
+    ln = find_line(raw, "+CSQ:")
+    if not ln:
+        return None, None
+    parts = [p.strip() for p in ln.split(":", 1)[-1].split(",")]
+    try:
+        rssi = int(parts[0])
+        ber = int(parts[1])
+    except (ValueError, IndexError):
+        return None, None
+    dbm = None if rssi == 99 else -113 + rssi * 2
+    return rssi, dbm
+
+
+def parse_temp(raw):
+    ln = find_line(raw, "^CHIPTEMP:")
+    if not ln:
+        return None
+    parts = [p.strip() for p in ln.split(":", 1)[-1].split(",") if p.strip()]
+    try:
+        return round(int(parts[0]) / 10.0, 1)
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_ndis(raw):
+    ln = find_line(raw, "^NDISSTATQRY:")
+    info = {"ipv4": False, "ipv6": False, "raw": ln}
+    if "IPV4" in ln:
+        info["ipv4"] = True
+    if "IPV6" in ln:
+        info["ipv6"] = True
+    return info
+
+
+
+def uci_get(key, default=""):
+    try:
+        out = subprocess.check_output(["uci", "-q", "get", key], stderr=subprocess.DEVNULL, text=True)
+        return out.strip() or default
+    except (OSError, subprocess.CalledProcessError):
+        return default
+
+
+def uci_set(key, value):
+    subprocess.call(["uci", "-q", "set", key + "=" + str(value)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.call(["uci", "-q", "commit", "cellmgr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def log_event(msg):
+    events = []
+    try:
+        with open(LOG, "r", encoding="utf-8") as fh:
+            events = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        events = []
+    events.append({"ts": int(time.time()), "msg": msg})
+    events = events[-30:]
+    tmp = LOG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(events, fh, ensure_ascii=False)
+    os.replace(tmp, LOG)
+
+
+def load_usage():
+    try:
+        with open(USAGE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_usage(data):
+    os.makedirs("/etc", exist_ok=True)
+    tmp = USAGE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, USAGE)
+
+
+def update_usage(stats):
+    today = time.strftime("%Y-%m-%d")
+    u = load_usage()
+    rx, tx = stats["rx_bytes"], stats["tx_bytes"]
+    if u.get("day") != today:
+        u = {
+            "day": today,
+            "day_rx": 0,
+            "day_tx": 0,
+            "session_rx": 0,
+            "session_tx": 0,
+            "last_rx": rx,
+            "last_tx": tx,
+        }
+    last_rx = int(u.get("last_rx") or rx)
+    last_tx = int(u.get("last_tx") or tx)
+    # counters can reset on modem replug
+    drx = rx - last_rx if rx >= last_rx else 0
+    dtx = tx - last_tx if tx >= last_tx else 0
+    u["day_rx"] = int(u.get("day_rx") or 0) + drx
+    u["day_tx"] = int(u.get("day_tx") or 0) + dtx
+    u["session_rx"] = int(u.get("session_rx") or 0) + drx
+    u["session_tx"] = int(u.get("session_tx") or 0) + dtx
+    u["last_rx"] = rx
+    u["last_tx"] = tx
+    u["day"] = today
+    save_usage(u)
+    return u
+
+
+def parse_monsc(raw):
+    # ^MONSC: NR,460,01,627264,1,87D4AA001,126,87D300,-87,-10,23
+    info = {"rat": "", "mcc": "", "mnc": "", "pci": "", "tac": "", "cell_id": "", "arfcn": "", "rsrp_dbm": None}
+    ln = find_line(raw, "^MONSC:")
+    if not ln:
+        return info
+    parts = [p.strip() for p in ln.split(":", 1)[-1].split(",")]
+    if len(parts) >= 8:
+        info["rat"] = parts[0]
+        info["mcc"] = parts[1]
+        info["mnc"] = parts[2].zfill(2)
+        info["arfcn"] = parts[3]
+        info["cell_id"] = parts[5]
+        info["pci"] = parts[6]
+        info["tac"] = parts[7]
+    if len(parts) >= 9:
+        try:
+            info["rsrp_dbm"] = int(parts[8])
+        except ValueError:
+            pass
+    return info
+
+
+def parse_cgpaddr(raw):
+    ipv4, ipv6 = [], []
+    for ln in lines_of(raw):
+        if not ln.startswith("+CGPADDR:"):
+            continue
+        body = ln.split(":", 1)[-1]
+        for tok in body.split(","):
+            tok = tok.strip().strip('"')
+            if tok.count(".") == 3 and all(p.isdigit() for p in tok.split(".")):
+                if tok != "0.0.0.0":
+                    ipv4.append(tok)
+            elif tok.count(".") == 15:
+                try:
+                    nums = [int(x) for x in tok.split(".")]
+                    if len(nums) == 16:
+                        hextets = ["%02x%02x" % (nums[i], nums[i + 1]) for i in range(0, 16, 2)]
+                        ipv6.append(":".join(hextets))
+                except ValueError:
+                    pass
+    return ipv4, ipv6
+
+
+NR_BANDS_ALL = [78, 41, 28, 1, 8, 5, 3]
+LTE_BANDS_ALL = [1, 3, 5, 8, 34, 38, 39, 40, 41]
+
+
+def parse_freqlock(raw, prefix):
+    info = {"mode": 0, "save": 0, "items": []}
+    started = False
+    for ln in lines_of(raw):
+        if ln.startswith(prefix):
+            rest = ln.split(":", 1)[-1].strip()
+            if rest.isdigit():
+                info["mode"] = int(rest)
+                started = True
+            continue
+        if not started:
+            continue
+        if ln in ("OK", "ERROR") or ln.startswith("+CME") or ln.startswith("AT"):
+            break
+        if "," in ln and not info["items"]:
+            bits = [p.strip() for p in ln.split(",")]
+            try:
+                info["save"] = int(bits[0])
+            except ValueError:
+                pass
+            continue
+        tok = ln.strip().strip('"')
+        if tok == "":
+            continue
+        try:
+            info["items"].append(int(tok))
+        except ValueError:
+            info["items"].append(tok)
+    return info
+
+
+def parse_cgdcont(raw):
+    for ln in lines_of(raw):
+        if not ln.startswith("+CGDCONT:"):
+            continue
+        parts = [p.strip().strip('"') for p in ln.split(":", 1)[-1].split(",")]
+        if not parts:
+            continue
+        try:
+            cid = int(parts[0])
+        except ValueError:
+            continue
+        if cid != 1:
+            continue
+        return {
+            "cid": cid,
+            "pdp": parts[1] if len(parts) > 1 else "",
+            "apn": parts[2] if len(parts) > 2 else "",
+        }
+    return {"cid": 1, "pdp": "IPV4V6", "apn": ""}
+
+
+def parse_band_list(text, allowed):
+    if text in ("all", "unlock", "*", ""):
+        return list(allowed)
+    out = []
+    for tok in str(text).split(","):
+        tok = tok.strip().lstrip("nNB")
+        if not tok.isdigit():
+            continue
+        n = int(tok)
+        if n in allowed and n not in out:
+            out.append(n)
+    return out
+
+
+def parse_sms(raw):
+    messages = []
+    cur = None
+    for ln in lines_of(raw):
+        if ln.startswith("+CMGL:"):
+            parts = [p.strip().strip('"') for p in ln.split(":", 1)[-1].split(",", 4)]
+            cur = {"index": parts[0] if parts else "", "status": parts[1] if len(parts) > 1 else "", "from": parts[2] if len(parts) > 2 else "", "time": parts[4] if len(parts) > 4 else "", "text": ""}
+            messages.append(cur)
+        elif cur is not None and not ln.startswith("OK") and not ln.startswith("AT"):
+            cur["text"] = (cur["text"] + ("\n" if cur["text"] else "") + ln).strip()
+    return messages
+
+
+def cmd_status():
+    busy = os.path.exists(BUSY)
+    gpio = readfile(GPIO_SEL)
+    pwr = readfile(GPIO_PWR)
+    cached = load_state()
+    cmds = [
+        "AT+CPIN?", "AT+CIMI", "AT^ICCID?", "AT+COPS?", "AT^HCSQ?",
+        "AT^SYSINFOEX", "AT^SCICHG?", "AT^HFREQINFO?", "AT^CHIPTEMP?", "AT^MONSC",
+        "AT^NRFREQLOCK?", "AT^LTEFREQLOCK?", "AT+CGDCONT?", 'AT+CLCK="SC",2',
+    ]
+    if not cached.get("imei"):
+        cmds = ["ATI"] + cmds
+    resps = at_many(cmds, 1.4)
+    ati = resps.get("ATI", "")
+    imei = cached.get("imei") or ""
+    model = cached.get("model") or "MT5700M-CN"
+    revision = cached.get("revision") or ""
+    manufacturer = cached.get("manufacturer") or "TD Tech"
+    for ln in lines_of(ati):
+        if ln.startswith("IMEI:"):
+            imei = ln.split(":", 1)[-1].strip()
+        elif ln.startswith("Model:"):
+            model = ln.split(":", 1)[-1].strip()
+        elif ln.startswith("Revision:"):
+            revision = ln.split(":", 1)[-1].strip()
+        elif ln.startswith("Manufacturer:"):
+            manufacturer = ln.split(":", 1)[-1].strip()
+    if imei and imei != cached.get("imei"):
+        save_state({"imei": imei, "model": model, "revision": revision, "manufacturer": manufacturer})
+
+    cpin = find_line(resps.get("AT+CPIN?", ""), "+CPIN:")
+    imsi = ""
+    for ln in lines_of(resps.get("AT+CIMI", "")):
+        if ln.isdigit() and len(ln) >= 14:
+            imsi = ln
+            break
+    iccid = find_line(resps.get("AT^ICCID?", ""), "^ICCID:")
+    if iccid:
+        iccid = iccid.split(":", 1)[-1].strip()
+    cops = parse_cops(resps.get("AT+COPS?", ""))
+    hcsq = parse_hcsq(find_line(resps.get("AT^HCSQ?", ""), "^HCSQ:"))
+    sysx = parse_sysinfoex(resps.get("AT^SYSINFOEX", ""))
+    scichg = parse_scichg(resps.get("AT^SCICHG?", ""))
+    hfreq = parse_hfreq(resps.get("AT^HFREQINFO?", ""))
+    csq_rssi, csq_dbm = None, None
+    temp = parse_temp(resps.get("AT^CHIPTEMP?", ""))
+    ndis = {"ipv4": "", "ipv6": ""}
+    c5 = ""
+    cereg = ""
+    cfg = ""
+    monsc = parse_monsc(resps.get("AT^MONSC", ""))
+    nrlock = parse_freqlock(resps.get("AT^NRFREQLOCK?", ""), "^NRFREQLOCK:")
+    ltelock = parse_freqlock(resps.get("AT^LTEFREQLOCK?", ""), "^LTEFREQLOCK:")
+    cgdcont = parse_cgdcont(resps.get("AT+CGDCONT?", ""))
+    clck = find_line(resps.get('AT+CLCK="SC",2', ""), "+CLCK:")
+    pin_enabled = clck.strip().endswith("1")
+    cpin_state = cpin.replace("+CPIN:", "").strip() if cpin else ""
+    _v4, pdp6 = [], []
+    st = ifstatus()
+    addrs = [a.get("address") for a in st.get("ipv4-address", []) if a.get("address")]
+    ip6 = [a.get("address") for a in st.get("ipv6-address", []) if a.get("address")] or pdp6
+    dns = st.get("dns-server") or []
+    stats = net_stats()
+    usage = update_usage(stats)
+    events = []
+    try:
+        with open(LOG, "r", encoding="utf-8") as fh:
+            events = json.load(fh)[-8:]
+    except (OSError, json.JSONDecodeError):
+        events = []
+    gw = None
+    for rt in st.get("route", []):
+        if rt.get("target") == "0.0.0.0":
+            gw = rt.get("nexthop")
+            break
+
+    plmn = imsi[:5] if len(imsi) >= 5 else ""
+    carrier = PLMN.get(plmn, cops["name"] or "未知")
+    if cops["name"]:
+        cops["carrier"] = PLMN.get(plmn, cops["name"])
+    else:
+        cops["carrier"] = carrier
+    cops["plmn"] = plmn
+
+    rat = hcsq["rat"] or sysx["sysmode_name"] or cops["act_name"] or "未知"
+    if "NR" in str(rat).upper() or rat in ("11", "12"):
+        rat_label = "5G"
+        rat_tech = "NR"
+    elif "LTE" in str(rat).upper() or rat == "7":
+        rat_label = "4G"
+        rat_tech = "LTE"
+    else:
+        rat_label = rat or "未知"
+        rat_tech = rat
+
+    slot = detect_slot(gpio, scichg)
+    rsrp = hcsq["rsrp_dbm"]
+    data = {
+        "ok": True,
+        "busy": busy,
+        "modem": {
+            "manufacturer": manufacturer,
+            "model": model,
+            "revision": revision,
+            "imei": imei,
+            "port": PORT,
+            "usb": "3466:3301",
+            "temp_c": temp,
+            "power_on": pwr == "1",
+            "power_gpio": pwr,
+        },
+        "sim": {
+            "slot": slot,
+            "slot_label": SLOTS.get(slot, {}).get("label", slot),
+            "gpio_sel": gpio,
+            "scichg": list(scichg),
+            "cpin": cpin_state,
+            "pin_enabled": pin_enabled,
+            "pin_required": "SIM PIN" in cpin_state,
+            "puk_required": "SIM PUK" in cpin_state,
+            "imsi": imsi,
+            "iccid": iccid,
+            "plmn": plmn,
+            "slots": {k: v["label"] for k, v in SLOTS.items()},
+        },
+        "network": {
+            "carrier": cops["carrier"],
+            "operator": cops["name"],
+            "plmn": plmn,
+            "rat": rat_tech,
+            "rat_label": rat_label,
+            "act": cops["act"],
+            "act_name": cops["act_name"],
+            "sysmode": sysx["sysmode_name"],
+            "submode": sysx["submode_name"],
+            "srv_status": sysx["srv_status"],
+            "roaming": bool(sysx["roam"]),
+            "band": hfreq["band"],
+            "dl_mhz": hfreq["dl_mhz"],
+            "bw_mhz": hfreq["bw_mhz"],
+            "c5greg": c5,
+            "cereg": cereg,
+            "syscfgex": cfg,
+            "ndis_ipv4": ndis["ipv4"],
+            "ndis_ipv6": ndis["ipv6"],
+            "pci": monsc["pci"],
+            "tac": monsc["tac"],
+            "cell_id": monsc["cell_id"],
+            "arfcn": hfreq.get("arfcn") or monsc["arfcn"],
+            "monsc_arfcn": monsc["arfcn"],
+            "band_num": hfreq.get("band_num"),
+            "cell_plmn": (monsc["mcc"] + monsc["mnc"]) if monsc["mcc"] else "",
+        },
+        "signal": {
+            "rsrp_dbm": rsrp,
+            "rsrq_db": hcsq["rsrq_db"],
+            "sinr_db": hcsq["sinr_db"],
+            "rssi_dbm": hcsq["rssi_dbm"] if hcsq["rssi_dbm"] is not None else csq_dbm,
+            "csq": csq_rssi,
+            "bars": bars_from_rsrp(rsrp),
+            "hcsq": hcsq["raw"],
+        },
+        "wan": {
+            "up": bool(st.get("up")),
+            "uptime": st.get("uptime"),
+            "device": st.get("device") or NETDEV,
+            "ipv4": addrs,
+            "ipv6": ip6,
+            "gateway": gw,
+            "dns": dns,
+        },
+        "traffic": stats,
+        "usage": {
+            "day": usage.get("day"),
+            "today_rx": usage.get("day_rx", 0),
+            "today_tx": usage.get("day_tx", 0),
+            "session_rx": usage.get("session_rx", 0),
+            "session_tx": usage.get("session_tx", 0),
+        },
+        "watchdog": {
+            "enabled": uci_get("cellmgr.main.watchdog", "1") != "0",
+            "failover": uci_get("cellmgr.main.failover", "0") == "1",
+            "ping_host": uci_get("cellmgr.main.ping_host", "1.1.1.1"),
+            "fail_count": int(load_state().get("watchdog_fail") or 0),
+        },
+        "apn": {
+            "apn": uci_get("cellmgr.main.apn", "") or cgdcont.get("apn") or "",
+            "pdp": uci_get("cellmgr.main.pdp", "IPV4V6") or cgdcont.get("pdp") or "IPV4V6",
+            "auth": uci_get("cellmgr.main.auth", "0") or "0",
+            "username": uci_get("cellmgr.main.username", ""),
+            "modem_apn": cgdcont.get("apn") or "",
+        },
+        "lock": {
+            "nr_mode": nrlock["mode"],
+            "nr_bands": nrlock["items"] if nrlock["mode"] == 3 else (NR_BANDS_ALL if nrlock["mode"] == 0 else []),
+            "nr_locked": nrlock["mode"] != 0,
+            "lte_mode": ltelock["mode"],
+            "lte_bands": ltelock["items"] if ltelock["mode"] == 3 else (LTE_BANDS_ALL if ltelock["mode"] == 0 else []),
+            "lte_locked": ltelock["mode"] != 0,
+            "nr_cell": nrlock["items"] if nrlock["mode"] in (1, 2) else [],
+            "lte_cell": ltelock["items"] if ltelock["mode"] in (1, 2) else [],
+            "available_nr": NR_BANDS_ALL,
+            "available_lte": LTE_BANDS_ALL,
+        },
+        "events": events,
+    }
+    save_state({"last_slot": slot, "last_status_ts": time.time()})
+    return data
+
+
+def wait_cpin(seconds=25):
+    deadline = time.time() + seconds
+    last = ""
+    while time.time() < deadline:
+        last = at("AT+CPIN?", 1.5)
+        if "READY" in last:
+            return True
+        if "SIM PIN" in last or "SIM PUK" in last:
+            return False
+        if "SIM not inserted" in last or "SIM failure" in last:
+            return False
+        time.sleep(1)
+    return "READY" in (last or at("AT+CPIN?", 1.5))
+
+
+def cpin_error():
+    raw = at("AT+CPIN?", 1.5)
+    state = find_line(raw, "+CPIN:").replace("+CPIN:", "").strip()
+    if "SIM PUK" in state:
+        return {"ok": False, "error": "需要 PUK", "cpin": state}
+    if "SIM PIN" in state:
+        return {"ok": False, "error": "需要 PIN", "cpin": state}
+    if "READY" not in state:
+        return {"ok": False, "error": "SIM 未就绪", "cpin": state}
+    return None
+
+
+def cmd_dial():
+    apn = uci_get("cellmgr.main.apn", "")
+    pdp = uci_get("cellmgr.main.pdp", "IPV4V6") or "IPV4V6"
+    if pdp not in ("IP", "IPV6", "IPV4V6"):
+        pdp = "IPV4V6"
+    auth = uci_get("cellmgr.main.auth", "0") or "0"
+    if auth not in ("0", "1", "2"):
+        auth = "0"
+    user = uci_get("cellmgr.main.username", "")
+    password = uci_get("cellmgr.main.password", "")
+    if apn:
+        if not re.match(r"^[A-Za-z0-9._-]{1,64}$", apn):
+            return {"ok": False, "error": "invalid apn"}
+        at('AT+CGDCONT=1,"%s","%s"' % (pdp, apn), 2)
+        at('AT^AUTHDATA=1,%s,"%s","%s"' % (auth, password.replace('"', ""), user.replace('"', "")), 2)
+        if user:
+            ndis = 'AT^NDISDUP=1,1,"%s","%s","%s",%s' % (apn, user, password, auth)
+        else:
+            ndis = 'AT^NDISDUP=1,1,"%s"' % apn
+        at(ndis, 3)
+    else:
+        at("AT^NDISDUP=1,1", 3)
+    subprocess.call(["ifup", IFACE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    st = ifstatus()
+    return {"ok": bool(st.get("up")), "up": bool(st.get("up")), "ipv4": [a.get("address") for a in st.get("ipv4-address", [])]}
+
+
+def cmd_hangup():
+    subprocess.call(["ifdown", IFACE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    at("AT^NDISDUP=1,0", 2)
+    return {"ok": True}
+
+
+def cmd_switch(slot):
+    if slot not in SLOTS:
+        return {"ok": False, "error": "unknown slot"}
+    spec = SLOTS[slot]
+    writefile(BUSY, slot)
+    try:
+        cmd_hangup()
+        at("AT+CFUN=4", 4)
+        time.sleep(1)
+        writefile(GPIO_SEL, spec["gpio"])
+        time.sleep(0.4)
+        resp = at("AT^SCICHG=%s,%s" % spec["scichg"], 3)
+        at("AT+CFUN=1", 4)
+        ready = wait_cpin(30)
+        if not ready:
+            pinerr = cpin_error() or {"ok": False, "error": "SIM 未就绪或未插入"}
+            pinerr.update({"slot": slot, "scichg": resp})
+            return pinerr
+        dial = cmd_dial()
+        save_state({"last_slot": slot})
+        log_event("切换到 %s" % spec["label"])
+        return {"ok": True, "slot": slot, "label": spec["label"], "dial": dial, "scichg": resp}
+    finally:
+        try:
+            os.remove(BUSY)
+        except OSError:
+            pass
+
+
+def cmd_rat(mode):
+    # Keep current band bitmask from SYSCFGEX query when possible.
+    raw = find_line(at("AT^SYSCFGEX?"), "^SYSCFGEX:")
+    rest = "3FFFFFFF,1,2,7FFFFFFFFFFFFFFF,,"
+    if raw and "," in raw:
+        parts = raw.split(":", 1)[-1].strip().split(",")
+        if len(parts) >= 5:
+            rest = ",".join(parts[1:])
+    acq = {"auto": "00", "lte": "03", "nr": "08"}.get(mode)
+    if not acq:
+        return {"ok": False, "error": "mode must be auto|lte|nr"}
+    cmd = 'AT^SYSCFGEX="%s",%s' % (acq, rest)
+    resp = at(cmd, 4)
+    return {"ok": ok(resp), "command": cmd, "response": resp}
+
+
+
+def cmd_reset():
+    log_event("模组复位 AT^RESET")
+    writefile(BUSY, "reset")
+    try:
+        subprocess.call(["ifdown", IFACE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        at("AT^RESET", 3)
+        return {"ok": True, "message": "modem reset sent"}
+    finally:
+        try:
+            os.remove(BUSY)
+        except OSError:
+            pass
+
+
+def cmd_sms_list():
+    at("AT+CMGF=1", 1.5)
+    at('AT+CPMS="SM","SM","SM"', 1.5)
+    raw = at('AT+CMGL="ALL"', 6)
+    return {"ok": True, "messages": parse_sms(raw)}
+
+
+def cmd_sms_send(number, text):
+    if not number or not text:
+        return {"ok": False, "error": "number and text required"}
+    at("AT+CMGF=1", 1.5)
+    os.makedirs("/var/lock", exist_ok=True)
+    lockfd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(lockfd, fcntl.LOCK_EX)
+    try:
+        tty = os.open(PORT, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            time.sleep(0.05)
+            try:
+                os.read(tty, 8192)
+            except BlockingIOError:
+                pass
+            os.write(tty, ('AT+CMGS="%s"\r' % number).encode("ascii", "ignore"))
+            buf = b""
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                time.sleep(0.05)
+                try:
+                    buf += os.read(tty, 4096)
+                except BlockingIOError:
+                    pass
+                if b">" in buf:
+                    break
+            payload = text.replace("\r", " ").encode("utf-8", "replace") + b"\x1a"
+            os.write(tty, payload)
+            buf = b""
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                time.sleep(0.1)
+                try:
+                    buf += os.read(tty, 4096)
+                except BlockingIOError:
+                    pass
+                if b"OK" in buf or b"ERROR" in buf:
+                    break
+            resp = buf.decode("utf-8", "replace")
+            good = "OK" in resp
+            if good:
+                log_event("短信已发送到 %s" % number)
+            return {"ok": good, "response": resp}
+        finally:
+            os.close(tty)
+    finally:
+        fcntl.flock(lockfd, fcntl.LOCK_UN)
+        os.close(lockfd)
+
+
+def cmd_usage_reset():
+    stats = net_stats()
+    save_usage({
+        "day": time.strftime("%Y-%m-%d"),
+        "day_rx": 0, "day_tx": 0,
+        "session_rx": 0, "session_tx": 0,
+        "last_rx": stats["rx_bytes"], "last_tx": stats["tx_bytes"],
+    })
+    return {"ok": True}
+
+
+def next_slot(current):
+    order = ["esim1", "esim2", "nano"]
+    if current not in order:
+        return "esim1"
+    return order[(order.index(current) + 1) % len(order)]
+
+
+def cmd_watchdog():
+    if uci_get("cellmgr.main.watchdog", "1") == "0":
+        return {"ok": True, "skipped": True}
+    if os.path.exists(BUSY):
+        return {"ok": True, "busy": True}
+    host = uci_get("cellmgr.main.ping_host", "1.1.1.1")
+    alive = False
+    for _ in range(2):
+        rc = subprocess.call(["ping", "-c", "1", "-W", "5", "-I", NETDEV, host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if rc == 0:
+            alive = True
+            break
+        time.sleep(1)
+    st = load_state()
+    if alive:
+        st["watchdog_fail"] = 0
+        save_state(st)
+        return {"ok": True, "alive": True}
+    fail = int(st.get("watchdog_fail") or 0) + 1
+    st["watchdog_fail"] = fail
+    save_state(st)
+    limit = int(uci_get("cellmgr.main.fail_limit", "3") or 3)
+    log_event("看门狗探测失败 %s/%s" % (fail, limit))
+    if fail < limit:
+        return {"ok": True, "alive": False, "fail": fail}
+    log_event("看门狗重新拨号")
+    dial = cmd_dial()
+    if dial.get("up"):
+        st["watchdog_fail"] = 0
+        save_state(st)
+        return {"ok": True, "redial": True, "up": True}
+    if uci_get("cellmgr.main.failover", "0") == "1":
+        gpio = readfile(GPIO_SEL)
+        scichg = parse_scichg(at("AT^SCICHG?"))
+        cur = detect_slot(gpio, scichg)
+        nxt = next_slot(cur)
+        log_event("看门狗故障转移 %s -> %s" % (cur, nxt))
+        return cmd_switch(nxt)
+    return {"ok": True, "alive": False, "redial": True, "up": False}
+
+
+def cmd_setcfg(key, value):
+    allowed = {"watchdog": ("0", "1"), "failover": ("0", "1")}
+    if key not in allowed or value not in allowed[key]:
+        return {"ok": False, "error": "invalid"}
+    uci_set("cellmgr.main." + key, value)
+    return {"ok": True, key: value}
+
+
+def busy_begin(tag):
+    writefile(BUSY, tag)
+
+
+def busy_end():
+    try:
+        os.remove(BUSY)
+    except OSError:
+        pass
+
+
+def try_at_list(cmds):
+    last = ""
+    used = ""
+    for cmd in cmds:
+        if not cmd:
+            continue
+        last = at(cmd, 3)
+        used = cmd
+        if ok(last):
+            return True, last, cmd
+    return False, last, used
+
+
+def set_band_lock(kind, bands):
+    prefix = "AT^NRFREQLOCK" if kind == "NR" else "AT^LTEFREQLOCK"
+    n = len(bands)
+    if n < 1:
+        return try_at_list(["%s=0" % prefix])
+    joined = ",".join(str(b) for b in bands)
+    quoted = ",".join('"%s"' % b for b in bands)
+    cmds = [
+        "%s=3,0,%d,%s" % (prefix, n, joined),
+        "%s=3,0,%d,%s" % (prefix, n, quoted),
+    ]
+    if n == 1:
+        if kind == "NR":
+            cmds.append('%s=3,0,1,"","","","%s"' % (prefix, bands[0]))
+        else:
+            cmds.append('%s=3,0,1,"","","%s"' % (prefix, bands[0]))
+        cmds.append("%s=3,0,1,%s" % (prefix, bands[0]))
+    return try_at_list(cmds)
+
+
+def radio_cycle(inner):
+    """Run inner() in airplane mode, then restore radio and dial."""
+    at("AT+CFUN=4", 4)
+    time.sleep(1)
+    try:
+        result = inner()
+    finally:
+        at("AT+CFUN=1", 4)
+        time.sleep(2)
+    pinerr = cpin_error()
+    if pinerr:
+        result = result or {}
+        result.update(pinerr)
+        return result
+    wait_cpin(20)
+    dial = cmd_dial()
+    if isinstance(result, dict):
+        result["dial"] = dial
+        if result.get("ok") and not dial.get("up"):
+            result["warning"] = "射频已设置，拨号未完成"
+    return result
+
+
+def cmd_apn(apn, pdp="IPV4V6", auth="0", user="", password="", redial="1"):
+    apn = (apn or "").strip()
+    if apn and not re.match(r"^[A-Za-z0-9._-]{1,64}$", apn):
+        return {"ok": False, "error": "invalid apn"}
+    if pdp not in ("IP", "IPV6", "IPV4V6"):
+        pdp = "IPV4V6"
+    if auth not in ("0", "1", "2"):
+        auth = "0"
+    if user and not re.match(r"^[\w.@+=-]{0,64}$", user):
+        return {"ok": False, "error": "invalid username"}
+    if password and not re.match(r"^[\w.@+=-]{0,64}$", password):
+        return {"ok": False, "error": "invalid password"}
+    uci_set("cellmgr.main.apn", apn)
+    uci_set("cellmgr.main.pdp", pdp)
+    uci_set("cellmgr.main.auth", auth)
+    uci_set("cellmgr.main.username", user)
+    uci_set("cellmgr.main.password", password)
+    log_event("保存 APN %s" % (apn or "(运营商默认)"))
+    if redial in ("0", "false", "no"):
+        return {"ok": True, "apn": apn, "pdp": pdp, "auth": auth}
+    busy_begin("apn")
+    try:
+        cmd_hangup()
+        dial = cmd_dial()
+        return {"ok": bool(dial.get("up")), "apn": apn, "dial": dial}
+    finally:
+        busy_end()
+
+
+def cmd_band(nr_spec, lte_spec=""):
+    nr_spec = (nr_spec or "").strip()
+    lte_spec = (lte_spec or "").strip()
+    if nr_spec == "current" or lte_spec == "current":
+        hfreq = parse_hfreq(at("AT^HFREQINFO?"))
+        bnum = hfreq.get("band_num")
+        if bnum is None:
+            return {"ok": False, "error": "读不到当前频段"}
+        if (hfreq.get("band") or "").startswith("n"):
+            nr_spec, lte_spec = str(bnum), "keep"
+        else:
+            nr_spec, lte_spec = "keep", str(bnum)
+    do_nr = nr_spec not in ("", "keep")
+    do_lte = lte_spec not in ("", "keep")
+    if not do_nr and not do_lte:
+        return {"ok": False, "error": "no bands"}
+    nr_unlock = do_nr and nr_spec in ("unlock", "all", "0")
+    lte_unlock = do_lte and lte_spec in ("unlock", "all", "0")
+    nr_bands = parse_band_list(nr_spec, NR_BANDS_ALL) if do_nr and not nr_unlock else []
+    lte_bands = parse_band_list(lte_spec, LTE_BANDS_ALL) if do_lte and not lte_unlock else []
+    if do_nr and not nr_unlock and not nr_bands:
+        return {"ok": False, "error": "invalid nr bands"}
+    if do_lte and not lte_unlock and not lte_bands:
+        return {"ok": False, "error": "invalid lte bands"}
+
+    def inner():
+        details = {}
+        good = True
+        if do_nr:
+            if nr_unlock:
+                ok1, resp, cmd = try_at_list(["AT^NRFREQLOCK=0"])
+            else:
+                ok1, resp, cmd = set_band_lock("NR", nr_bands)
+            details["nr"] = {"ok": ok1, "cmd": cmd, "response": resp, "bands": nr_bands or "unlock"}
+            good = good and ok1
+        if do_lte:
+            if lte_unlock:
+                ok2, resp, cmd = try_at_list(["AT^LTEFREQLOCK=0"])
+            else:
+                ok2, resp, cmd = set_band_lock("LTE", lte_bands)
+            details["lte"] = {"ok": ok2, "cmd": cmd, "response": resp, "bands": lte_bands or "unlock"}
+            good = good and ok2
+        details["ok"] = good
+        return details
+
+    busy_begin("band")
+    try:
+        # Unlock is known to work while registered; lock may need airplane mode.
+        if (nr_unlock or not do_nr) and (lte_unlock or not do_lte):
+            out = inner()
+            log_event("频段锁已解除")
+            return out
+        out = radio_cycle(inner)
+        log_event("频段锁定 NR=%s LTE=%s" % (nr_spec, lte_spec or "-"))
+        return out
+    finally:
+        busy_end()
+
+
+def cmd_celllock(action, pci="", arfcn="", band="", scs=""):
+    action = (action or "").strip().lower()
+    if action in ("off", "unlock", "0"):
+        busy_begin("cell")
+        try:
+            ok1, resp, cmd = try_at_list(["AT^NRFREQLOCK=0"])
+            try_at_list(["AT^LTEFREQLOCK=0"])
+            log_event("小区锁定已解除")
+            return {"ok": ok1, "cmd": cmd, "response": resp}
+        finally:
+            busy_end()
+    hfreq = parse_hfreq(at("AT^HFREQINFO?"))
+    monsc = parse_monsc(at("AT^MONSC"))
+    pci = pci or monsc.get("pci") or ""
+    arfcn = arfcn or hfreq.get("arfcn") or monsc.get("arfcn") or ""
+    band = str(band or hfreq.get("band_num") or "").lstrip("nNB")
+    scs = scs or "1"
+    if not pci or not arfcn or not band:
+        return {"ok": False, "error": "缺少 PCI/ARFCN/频段"}
+    is_nr = (hfreq.get("band") or "n").startswith("n") or (monsc.get("rat") or "").upper().startswith("NR")
+
+    def inner():
+        if is_nr:
+            cmds = [
+                "AT^NRFREQLOCK=2,0,1,%s,%s,%s,%s" % (arfcn, pci, scs, band),
+                'AT^NRFREQLOCK=2,0,1,"%s","%s","%s","%s"' % (arfcn, pci, scs, band),
+                "AT^NRFREQLOCK=1,0,1,%s" % arfcn,
+                'AT^NRFREQLOCK=1,0,1,"%s"' % arfcn,
+            ]
+        else:
+            cmds = [
+                "AT^LTEFREQLOCK=2,0,1,%s,%s,%s" % (arfcn, pci, band),
+                'AT^LTEFREQLOCK=2,0,1,"%s","%s","%s"' % (arfcn, pci, band),
+                "AT^LTEFREQLOCK=1,0,1,%s" % arfcn,
+            ]
+        good, resp, cmd = try_at_list(cmds)
+        return {"ok": good, "cmd": cmd, "response": resp, "pci": pci, "arfcn": arfcn, "band": band}
+
+    busy_begin("cell")
+    try:
+        out = radio_cycle(inner)
+        log_event("小区锁定 PCI %s ARFCN %s" % (pci, arfcn))
+        return out
+    finally:
+        busy_end()
+
+
+def cmd_pin(action, pin="", puk="", newpin=""):
+    action = (action or "").strip().lower()
+    if pin and not re.match(r"^\d{4,8}$", pin):
+        return {"ok": False, "error": "PIN 须为 4-8 位数字"}
+    if puk and not re.match(r"^\d{8}$", puk):
+        return {"ok": False, "error": "PUK 须为 8 位数字"}
+    if newpin and not re.match(r"^\d{4,8}$", newpin):
+        return {"ok": False, "error": "新 PIN 须为 4-8 位数字"}
+    if action == "enter":
+        if not pin:
+            return {"ok": False, "error": "需要 PIN"}
+        resp = at('AT+CPIN="%s"' % pin, 4)
+        if ok(resp):
+            wait_cpin(15)
+            cmd_dial()
+            log_event("已输入 PIN")
+    elif action == "puk":
+        if not puk or not (newpin or pin):
+            return {"ok": False, "error": "需要 PUK 和新 PIN"}
+        resp = at('AT+CPIN="%s","%s"' % (puk, newpin or pin), 4)
+        if ok(resp):
+            wait_cpin(15)
+            cmd_dial()
+            log_event("已输入 PUK")
+    elif action == "enable":
+        if not pin:
+            return {"ok": False, "error": "需要 PIN"}
+        resp = at('AT+CLCK="SC",1,"%s"' % pin, 4)
+        log_event("已开启 SIM PIN")
+    elif action == "disable":
+        if not pin:
+            return {"ok": False, "error": "需要 PIN"}
+        resp = at('AT+CLCK="SC",0,"%s"' % pin, 4)
+        log_event("已关闭 SIM PIN")
+    else:
+        return {"ok": False, "error": "action must be enter|puk|enable|disable"}
+    cpin = find_line(at("AT+CPIN?"), "+CPIN:")
+    return {"ok": ok(resp), "response": resp, "cpin": cpin.replace("+CPIN:", "").strip() if cpin else ""}
+
+
+def cmd_speed():
+    busy_begin("speed")
+    try:
+        before = net_stats()
+        t0 = time.time()
+        used = None
+        for url in (
+            "https://speed.cloudflare.com/__down?bytes=8000000",
+            "https://speed.cloudflare.com/__down?bytes=2000000",
+        ):
+            rc = subprocess.call(
+                ["wget", "--no-check-certificate", "--no-proxy", "-q", "-O", "/dev/null", "-T", "20", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if rc == 0:
+                used = url
+                break
+        dt = max(time.time() - t0, 0.001)
+        after = net_stats()
+        drx = max(after["rx_bytes"] - before["rx_bytes"], 0)
+        dtx = max(after["tx_bytes"] - before["tx_bytes"], 0)
+        return {
+            "ok": bool(used),
+            "seconds": round(dt, 2),
+            "rx_bytes": drx,
+            "tx_bytes": dtx,
+            "download_mbps": round(drx * 8 / dt / 1e6, 2),
+            "upload_mbps": round(dtx * 8 / dt / 1e6, 2),
+            "url": used or "",
+        }
+    finally:
+        busy_end()
+
+
+def cmd_scan():
+    resp = at("AT+COPS=?", 90)
+    ops = []
+    ln = find_line(resp, "+COPS:")
+    # +COPS: (1,"CHN-UNICOM","UNICOM","46001",12),(...),,(0,1,2,3,4)
+    body = ln.split(":", 1)[-1] if ln else resp
+    for m in __import__("re").findall(r'\((\d+),"([^"]*)","([^"]*)","(\d+)",(\d+)\)', body):
+        stat, longn, shortn, numeric, act = m
+        ops.append({
+            "stat": int(stat),
+            "name": longn,
+            "short": shortn,
+            "plmn": numeric,
+            "carrier": PLMN.get(numeric, longn),
+            "act": int(act),
+            "act_name": ACT.get(int(act), str(act)),
+        })
+    return {"ok": ok(resp) or bool(ops), "operators": ops, "raw": ln}
+
+
+def cmd_select(plmn, act=None):
+    if plmn in ("auto", "0", ""):
+        resp = at("AT+COPS=0", 8)
+        return {"ok": ok(resp), "response": resp}
+    if act:
+        resp = at('AT+COPS=1,2,"%s",%s' % (plmn, act), 12)
+    else:
+        resp = at('AT+COPS=1,2,"%s"' % plmn, 12)
+    return {"ok": ok(resp), "response": resp}
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: cellmgr status|switch <slot>|rat <auto|lte|nr>|dial|hangup|scan|select <plmn> [act]|at <cmd>", file=sys.stderr)
+        sys.exit(2)
+    action = sys.argv[1]
+    if action == "status":
+        out = cmd_status()
+    elif action == "switch":
+        out = cmd_switch(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif action == "rat":
+        out = cmd_rat(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif action == "dial":
+        out = cmd_dial()
+    elif action == "hangup":
+        out = cmd_hangup()
+    elif action == "scan":
+        out = cmd_scan()
+    elif action == "select":
+        out = cmd_select(sys.argv[2] if len(sys.argv) > 2 else "auto",
+                         sys.argv[3] if len(sys.argv) > 3 else None)
+    elif action == "reset":
+        out = cmd_reset()
+    elif action == "sms":
+        out = cmd_sms_list()
+    elif action == "sms_send":
+        out = cmd_sms_send(sys.argv[2] if len(sys.argv) > 2 else "",
+                           " ".join(sys.argv[3:]) if len(sys.argv) > 3 else "")
+    elif action == "usage_reset":
+        out = cmd_usage_reset()
+    elif action == "watchdog":
+        out = cmd_watchdog()
+    elif action == "setcfg":
+        out = cmd_setcfg(sys.argv[2] if len(sys.argv) > 2 else "",
+                         sys.argv[3] if len(sys.argv) > 3 else "")
+    elif action == "apn":
+        out = cmd_apn(sys.argv[2] if len(sys.argv) > 2 else "",
+                      sys.argv[3] if len(sys.argv) > 3 else "IPV4V6",
+                      sys.argv[4] if len(sys.argv) > 4 else "0",
+                      sys.argv[5] if len(sys.argv) > 5 else "",
+                      sys.argv[6] if len(sys.argv) > 6 else "",
+                      sys.argv[7] if len(sys.argv) > 7 else "1")
+    elif action == "band":
+        out = cmd_band(sys.argv[2] if len(sys.argv) > 2 else "",
+                       sys.argv[3] if len(sys.argv) > 3 else "")
+    elif action == "celllock":
+        out = cmd_celllock(sys.argv[2] if len(sys.argv) > 2 else "",
+                           sys.argv[3] if len(sys.argv) > 3 else "",
+                           sys.argv[4] if len(sys.argv) > 4 else "",
+                           sys.argv[5] if len(sys.argv) > 5 else "",
+                           sys.argv[6] if len(sys.argv) > 6 else "")
+    elif action == "pin":
+        out = cmd_pin(sys.argv[2] if len(sys.argv) > 2 else "",
+                      sys.argv[3] if len(sys.argv) > 3 else "",
+                      sys.argv[4] if len(sys.argv) > 4 else "",
+                      sys.argv[5] if len(sys.argv) > 5 else "")
+    elif action == "speed":
+        out = cmd_speed()
+    elif action == "at":
+        cmd = " ".join(sys.argv[2:])
+        if not cmd.upper().startswith("AT"):
+            out = {"ok": False, "error": "AT only"}
+        else:
+            out = {"ok": True, "response": at(cmd, 4)}
+    else:
+        out = {"ok": False, "error": "unknown action"}
+    json.dump(out, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

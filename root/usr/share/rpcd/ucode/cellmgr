@@ -1,0 +1,170 @@
+'use strict';
+
+import { popen } from 'fs';
+
+function shellquote(s) {
+	return `'${replace(s ?? '', "'", "'\\''")}'`;
+}
+
+function run(args) {
+	const fd = popen('/usr/sbin/cellmgr ' + args + ' 2>/dev/null');
+	if (!fd)
+		return { ok: false, error: 'popen failed' };
+	const raw = fd.read('all') ?? '';
+	fd.close();
+	try {
+		return json(raw);
+	}
+	catch (e) {
+		return { ok: false, error: 'invalid json', raw };
+	}
+}
+
+const methods = {
+	status: { call: function() { return run('status'); } },
+	switch_slot: {
+		args: { slot: 'esim1' },
+		call: function(request) {
+			const slot = request.args.slot;
+			if (slot != 'nano' && slot != 'esim1' && slot != 'esim2')
+				return { ok: false, error: 'invalid slot' };
+			return run('switch ' + shellquote(slot));
+		}
+	},
+	set_rat: {
+		args: { mode: 'auto' },
+		call: function(request) {
+			const mode = request.args.mode;
+			if (mode != 'auto' && mode != 'lte' && mode != 'nr')
+				return { ok: false, error: 'invalid mode' };
+			return run('rat ' + shellquote(mode));
+		}
+	},
+	dial: { call: function() { return run('dial'); } },
+	hangup: { call: function() { return run('hangup'); } },
+	scan: { call: function() { return run('scan'); } },
+	select_op: {
+		args: { plmn: '46001', act: '12' },
+		call: function(request) {
+			const plmn = request.args.plmn ?? 'auto';
+			if (!match(plmn, regexp('^(auto|[0-9]{5,6})$')))
+				return { ok: false, error: 'invalid plmn' };
+			let cmd = 'select ' + shellquote(plmn);
+			const act = request.args.act;
+			if (act && match(act, regexp('^[0-9]{1,2}$')))
+				cmd += ' ' + act;
+			return run(cmd);
+		}
+	},
+	reset: { call: function() { return run('reset'); } },
+	sms_list: { call: function() { return run('sms'); } },
+	sms_send: {
+		args: { number: '10086', text: '1' },
+		call: function(request) {
+			const number = request.args.number ?? '';
+			const text = request.args.text ?? '';
+			if (!match(number, regexp('^[+0-9]{3,20}$')))
+				return { ok: false, error: 'invalid number' };
+			if (length(text) < 1 || length(text) > 280)
+				return { ok: false, error: 'invalid text' };
+			return run('sms_send ' + shellquote(number) + ' ' + shellquote(text));
+		}
+	},
+	usage_reset: { call: function() { return run('usage_reset'); } },
+	setcfg: {
+		args: { key: 'watchdog', value: '1' },
+		call: function(request) {
+			const key = request.args.key;
+			const value = request.args.value;
+			if (key != 'watchdog' && key != 'failover')
+				return { ok: false, error: 'invalid key' };
+			return run('setcfg ' + shellquote(key) + ' ' + shellquote(value));
+		}
+	},
+	apn: {
+		args: { apn: '3gnet', pdp: 'IPV4V6', auth: '0', username: '', password: '', redial: '1' },
+		call: function(request) {
+			const apn = request.args.apn ?? '';
+			const pdp = request.args.pdp ?? 'IPV4V6';
+			const auth = request.args.auth ?? '0';
+			const username = request.args.username ?? '';
+			const password = request.args.password ?? '';
+			const redial = request.args.redial ?? '1';
+			if (apn != '' && !match(apn, regexp('^[A-Za-z0-9._-]{1,64}$')))
+				return { ok: false, error: 'invalid apn' };
+			if (pdp != 'IP' && pdp != 'IPV6' && pdp != 'IPV4V6')
+				return { ok: false, error: 'invalid pdp' };
+			if (auth != '0' && auth != '1' && auth != '2')
+				return { ok: false, error: 'invalid auth' };
+			if (username != '' && !match(username, regexp('^[A-Za-z0-9._@+=-]{0,64}$')))
+				return { ok: false, error: 'invalid username' };
+			if (password != '' && !match(password, regexp('^[A-Za-z0-9._@+=-]{0,64}$')))
+				return { ok: false, error: 'invalid password' };
+			return run('apn ' + shellquote(apn) + ' ' + shellquote(pdp) + ' ' + shellquote(auth) + ' ' +
+				shellquote(username) + ' ' + shellquote(password) + ' ' + shellquote(redial));
+		}
+	},
+	band: {
+		args: { nr: '78', lte: 'keep' },
+		call: function(request) {
+			const nr = request.args.nr ?? 'keep';
+			const lte = request.args.lte ?? 'keep';
+			if (!match(nr, regexp('^(keep|current|unlock|all|[0-9]+(,[0-9]+)*)$')))
+				return { ok: false, error: 'invalid nr' };
+			if (!match(lte, regexp('^(keep|current|unlock|all|[0-9]+(,[0-9]+)*)$')))
+				return { ok: false, error: 'invalid lte' };
+			return run('band ' + shellquote(nr) + ' ' + shellquote(lte));
+		}
+	},
+	celllock: {
+		args: { action: 'on', pci: '', arfcn: '', band: '', scs: '1' },
+		call: function(request) {
+			const action = request.args.action ?? 'on';
+			if (action != 'on' && action != 'off')
+				return { ok: false, error: 'invalid action' };
+			const pci = request.args.pci ?? '';
+			const arfcn = request.args.arfcn ?? '';
+			const band = request.args.band ?? '';
+			const scs = request.args.scs ?? '';
+			if (pci != '' && !match(pci, regexp('^[0-9A-Fa-f]+$')))
+				return { ok: false, error: 'invalid pci' };
+			if (arfcn != '' && !match(arfcn, regexp('^[0-9]+$')))
+				return { ok: false, error: 'invalid arfcn' };
+			if (band != '' && !match(band, regexp('^[0-9]{1,3}$')))
+				return { ok: false, error: 'invalid band' };
+			return run('celllock ' + shellquote(action) + ' ' + shellquote(pci) + ' ' +
+				shellquote(arfcn) + ' ' + shellquote(band) + ' ' + shellquote(scs));
+		}
+	},
+	pin: {
+		args: { action: 'enter', pin: '0000', puk: '', newpin: '' },
+		call: function(request) {
+			const action = request.args.action ?? '';
+			if (action != 'enter' && action != 'puk' && action != 'enable' && action != 'disable')
+				return { ok: false, error: 'invalid action' };
+			const pin = request.args.pin ?? '';
+			const puk = request.args.puk ?? '';
+			const newpin = request.args.newpin ?? '';
+			if (pin != '' && !match(pin, regexp('^[0-9]{4,8}$')))
+				return { ok: false, error: 'invalid pin' };
+			if (puk != '' && !match(puk, regexp('^[0-9]{8}$')))
+				return { ok: false, error: 'invalid puk' };
+			if (newpin != '' && !match(newpin, regexp('^[0-9]{4,8}$')))
+				return { ok: false, error: 'invalid newpin' };
+			return run('pin ' + shellquote(action) + ' ' + shellquote(pin) + ' ' +
+				shellquote(puk) + ' ' + shellquote(newpin));
+		}
+	},
+	speed: { call: function() { return run('speed'); } },
+	at: {
+		args: { cmd: 'AT' },
+		call: function(request) {
+			const cmd = request.args.cmd ?? '';
+			if (!match(cmd, regexp('^AT[A-Za-z0-9^?=" ,._:+-]{0,80}$')))
+				return { ok: false, error: 'invalid AT' };
+			return run('at ' + shellquote(cmd));
+		}
+	}
+};
+
+return { 'luci.cellmgr': methods };

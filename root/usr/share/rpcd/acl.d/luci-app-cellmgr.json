@@ -1,0 +1,21 @@
+{
+	"luci-app-cellmgr": {
+		"description": "Grant access to C2000-MAX cellular manager",
+		"read": {
+			"ubus": {
+				"luci.cellmgr": [ "status", "scan", "sms_list", "speed" ]
+			},
+			"uci": [ "cellmgr" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.cellmgr": [
+					"switch_slot", "set_rat", "dial", "hangup", "select_op",
+					"reset", "sms_send", "usage_reset", "setcfg", "at",
+					"apn", "band", "celllock", "pin"
+				]
+			},
+			"uci": [ "cellmgr" ]
+		}
+	}
+}
