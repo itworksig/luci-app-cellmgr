@@ -1,6 +1,6 @@
 # luci-app-cellmgr
 
-OpenWrt LuCI 应用，用于 NRadio C2000-MAX（WT9303）上的 **TD Tech MT5700** 蜂窝模组：两张内置 eSIM + 一张外置 nano SIM。
+OpenWrt LuCI 应用，用于 NRadio / 鲲鹏 C2000-MAX（WT9303）上的 **TD Tech MT5700** 蜂窝模组：两张内置 eSIM + 一张外置 nano SIM。
 
 LuCI 菜单：**网络 → 蜂窝模组**
 
