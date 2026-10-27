@@ -260,6 +260,7 @@ return view.extend({
 				E('div', { 'class': 'cellmgr-panel', 'id': 'cellmgr-usage' }),
 				E('div', { 'class': 'cellmgr-panel', 'id': 'cellmgr-watch' })
 			]),
+			E('div', { 'class': 'cellmgr-panel', 'style': 'margin-top:14px', 'id': 'cellmgr-cloud' }),
 			E('div', { 'class': 'cellmgr-grid', 'style': 'margin-top:14px' }, [
 				E('div', { 'class': 'cellmgr-panel', 'id': 'cellmgr-apn' }),
 				E('div', { 'class': 'cellmgr-panel', 'id': 'cellmgr-pin' })
@@ -399,6 +400,43 @@ return view.extend({
 					E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'handleUsageReset') }, [ _('清零统计') ]),
 					E('button', { 'class': 'btn cbi-button-action', 'click': ui.createHandlerFn(this, 'handleSpeed') }, [ _('测速') ])
 				])
+			]);
+		}
+		const cloud = data.cloud || {};
+		const cloudEl = document.getElementById('cellmgr-cloud');
+		if (cloudEl) {
+			const on = !!cloud.enabled;
+			const stateText = !on ? _('已关闭') :
+				(cloud.state === 'connected' ? _('已连接') :
+				(cloud.state === 'connecting' || cloud.state === 'retry' ? _('连接中') :
+				(cloud.state === 'identity_error' ? _('设备身份无效') : _('未连接'))));
+			const idInput = document.getElementById('cellmgr-cloud-id');
+			const codeInput = document.getElementById('cellmgr-cloud-code');
+			const keepId = idInput ? idInput.value : (cloud.device_id || '');
+			const keepCode = codeInput ? codeInput.value : (cloud.device_code || '');
+			dom.content(cloudEl, [
+				E('h3', {}, [ _('鲲鹏网管上报') ]),
+				E('div', { 'class': 'cellmgr-desc' }, [
+					_('默认关闭。开启后向官方 App 上报在线和信号，可随时关掉。')
+				]),
+				E('div', { 'class': 'cellmgr-kvs' }, [
+					kv(_('开关'), on ? _('开') : _('关')),
+					kv(_('状态'), stateText),
+					kv(_('当前设备 ID'), cloud.device_id || '—'),
+					kv(_('上次心跳'), cloud.last_presence ? '%t'.format(cloud.last_presence) : '—')
+				]),
+				E('div', { 'class': 'cellmgr-actions' }, [
+					E('button', {
+						'class': on ? 'btn cbi-button-negative' : 'btn cbi-button-action',
+						'click': ui.createHandlerFn(this, 'handleCfg', 'cloud_enable', on ? '0' : '1')
+					}, [ on ? _('关闭上报') : _('开启上报') ])
+				]),
+				E('div', { 'class': 'cellmgr-actions', 'style': 'margin-top:8px' }, [
+					E('input', { 'id': 'cellmgr-cloud-id', 'placeholder': _('机身 MAC，不要填 Wi-Fi MAC'), 'value': keepId, 'style': 'min-width:180px' }),
+					E('input', { 'id': 'cellmgr-cloud-code', 'placeholder': _('铭牌设备码'), 'value': keepCode, 'style': 'min-width:160px' }),
+					E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'handleCloudIdent') }, [ _('保存身份') ])
+				]),
+				cloud.message ? E('div', { 'style': 'margin-top:8px;color:var(--a-dim,#8aa);font-size:12px' }, [ cloud.message ]) : E('span')
 			]);
 		}
 		const watchEl = document.getElementById('cellmgr-watch');
@@ -720,6 +758,24 @@ return view.extend({
 		return callSetcfg(key, value).then(res => {
 			if (!res || res.ok === false)
 				ui.addNotification(null, E('p', {}, [ (res && res.error) || _('设置失败') ]), 'error');
+			return L.resolveDefault(callStatus(), {}).then(L.bind(this.update, this));
+		});
+	},
+
+	handleCloudIdent() {
+		const id = (document.getElementById('cellmgr-cloud-id') || {}).value || '';
+		const code = (document.getElementById('cellmgr-cloud-code') || {}).value || '';
+		return callSetcfg('cloud_id', id).then(res => {
+			if (!res || res.ok === false) {
+				ui.addNotification(null, E('p', {}, [ (res && res.error) || _('保存失败') ]), 'error');
+				return res;
+			}
+			return callSetcfg('cloud_code', code);
+		}).then(res => {
+			if (!res || res.ok === false)
+				ui.addNotification(null, E('p', {}, [ (res && res.error) || _('保存失败') ]), 'error');
+			else
+				ui.addNotification(null, E('p', {}, [ _('设备身份已保存，开关打开后生效') ]), 'info');
 			return L.resolveDefault(callStatus(), {}).then(L.bind(this.update, this));
 		});
 	},

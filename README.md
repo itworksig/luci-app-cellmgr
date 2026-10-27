@@ -11,13 +11,14 @@ LuCI：**网络 → 蜂窝模组**
 - RSRP / RSRQ / SINR、PCI / TAC / Cell ID / ARFCN、IMEI / IMSI / ICCID、模组温度
 - 实时速率、今日 / 本次流量、断线重拨、可选故障切卡
 - APN 编辑、频段锁定、小区锁定、PIN / PUK、短信、AT 调试、测速
+- 鲲鹏网管上报（可开关）：在线心跳与信号
 
 ## 安装
 
 从 [Releases](https://github.com/itworksig/luci-app-cellmgr/releases) 下载 `luci-app-cellmgr-vX.Y.Z-all.ipk`：
 
 ```sh
-opkg install luci-app-cellmgr-v0.3.0-all.ipk
+opkg install luci-app-cellmgr-v0.4.0-all.ipk
 ```
 
 把 `VERSION` 改掉并推到 `main`，GitHub Actions 会自动再打一包。

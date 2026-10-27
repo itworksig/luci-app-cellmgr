@@ -1,0 +1,723 @@
+#!/usr/bin/python3
+"""Report CPE presence and cellular signal to 鲲鹏网管 via MQTT.
+
+Factory firmware publishes to {fac_mac}.dev.nradio.com.cn:1883.
+Without that heartbeat the official app shows the router as 离线.
+"""
+from __future__ import annotations
+
+import json
+import os
+import select
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+BROKER_SUFFIX = ".dev.nradio.com.cn"
+MQTT_PORT = 1883
+USERNAME = "router"
+STATE_PATH = "/var/run/cellmgr-cloud.json"
+KPCPE_PORT = 8888
+FACTORY_DEV = "/dev/mmcblk0p3"
+BDINFO_FILES = (
+    "/mnt/app_data/bdinfo",
+    "/etc/bdinfo.bin",
+    "/bdinfo/bdinfo.bin",
+)
+SLOT_MAP = {
+    "nano": ("0", "1"),
+    "esim1": ("4", "1"),
+    "esim2": ("4", "2"),
+}
+
+
+def log(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        with open("/tmp/cellmgr-cloud.log", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def uci_get(key, default=""):
+    try:
+        out = subprocess.check_output(["uci", "-q", "get", key], stderr=subprocess.DEVNULL, text=True)
+        return out.strip() or default
+    except (OSError, subprocess.CalledProcessError):
+        return default
+
+
+def cloud_enabled():
+    return uci_get("cellmgr.main.cloud_enable", "0") == "1"
+
+
+def write_state(data):
+    data = dict(data)
+    data["updated"] = int(time.time())
+    os.makedirs("/var/run", exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, STATE_PATH)
+
+
+def clean_mac(value):
+    if not value:
+        return None
+    hexid = "".join(ch for ch in str(value).upper() if ch in "0123456789ABCDEF")
+    if len(hexid) != 12 or hexid in ("000000000000", "FFFFFFFFFFFF"):
+        return None
+    first = int(hexid[:2], 16)
+    if first % 2:
+        return None
+    return hexid
+
+
+def parse_bdinfo(raw):
+    out = {}
+    if not raw:
+        return out
+    text = raw.replace("\x00", "\n").replace("\xff", "\n")
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = "".join(ch for ch in key.strip().lower() if ch.isalnum() or ch == "_")
+        val = val.strip().strip("\x00")
+        if key in ("fac_mac", "device_code", "fac_key", "app_secret", "crypto_secret") and val and key not in out:
+            out[key] = val
+    return out
+
+
+def read_bytes(path, maximum=65536, offset=0):
+    try:
+        with open(path, "rb") as fh:
+            if offset:
+                fh.seek(offset)
+            return fh.read(maximum)
+    except OSError:
+        return b""
+
+
+def factory_mac():
+    raw = read_bytes(FACTORY_DEV, 6, 4)
+    if len(raw) == 6:
+        return clean_mac(raw.hex())
+    for path in ("/sys/class/ieee80211/phy0/macaddress", "/sys/class/net/eth0/address"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                mac = clean_mac(fh.read())
+                if mac:
+                    return mac
+        except OSError:
+            continue
+    return None
+
+
+def load_identity():
+    merged = {}
+    source = ""
+    for path in BDINFO_FILES:
+        values = parse_bdinfo(read_bytes(path).decode("latin1", "ignore"))
+        if values:
+            source = source or path
+            for key, val in values.items():
+                merged.setdefault(key, val)
+    override_id = clean_mac(uci_get("cellmgr.main.cloud_id"))
+    override_code = uci_get("cellmgr.main.cloud_code")
+    bdinfo_id = clean_mac(merged.get("fac_mac"))
+    fac_id = factory_mac()
+    device_id = override_id or bdinfo_id or fac_id
+    device_code = override_code or merged.get("device_code") or ""
+    return {
+        "device_id": device_id or "",
+        "device_code": device_code,
+        "bdinfo_id": bdinfo_id or "",
+        "factory_id": fac_id or "",
+        "source": "uci" if override_id else (source or "factory"),
+        "broker": (device_id + BROKER_SUFFIX) if device_id else "",
+    }
+
+
+def encode_remaining(n):
+    out = bytearray()
+    while True:
+        byte = n % 128
+        n //= 128
+        if n:
+            byte |= 0x80
+        out.append(byte)
+        if not n:
+            break
+    return bytes(out)
+
+
+def mqtt_str(s):
+    data = s.encode("utf-8")
+    return struct.pack("!H", len(data)) + data
+
+
+class MqttClient:
+    def __init__(self, host, client_id, username):
+        self.host = host
+        self.client_id = client_id
+        self.username = username
+        self.sock = None
+        self.buf = b""
+        self.packet_id = 1
+        self.last_io = 0
+
+    def _next_id(self):
+        pid = self.packet_id
+        self.packet_id = 1 if pid >= 65535 else pid + 1
+        return pid
+
+    def connect(self, timeout=12):
+        self.close()
+        ip = lookup_ipv4(self.host)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, MQTT_PORT))
+        sock.settimeout(None)
+        flags = 0x80  # username, persistent session like factory mqttagent
+        payload = mqtt_str(self.client_id) + mqtt_str(self.username)
+        variable = mqtt_str("MQTT") + bytes([0x04, flags]) + struct.pack("!H", 10) + payload
+        sock.sendall(b"\x10" + encode_remaining(len(variable)) + variable)
+        self.sock = sock
+        self.buf = b""
+        pkt = self._recv_packet(timeout=timeout)
+        if not pkt or pkt[0] != 0x20 or len(pkt) < 4 or pkt[-1] != 0:
+            self.close()
+            raise OSError("mqtt connack failed: %r" % (pkt.hex() if pkt else None))
+        log("mqtt connack %s via %s" % (pkt.hex(), ip))
+        self.last_io = time.time()
+        return True
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.sendall(b"\xe0\x00")
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.buf = b""
+
+    def _recv_packet(self, timeout=8):
+        deadline = time.time() + timeout
+        while True:
+            if len(self.buf) >= 2:
+                idx = 1
+                multiplier = 1
+                remaining = 0
+                while True:
+                    if idx >= len(self.buf):
+                        break
+                    byte = self.buf[idx]
+                    remaining += (byte & 0x7F) * multiplier
+                    idx += 1
+                    if byte & 0x80 == 0:
+                        total = idx + remaining
+                        if len(self.buf) >= total:
+                            pkt = self.buf[:total]
+                            self.buf = self.buf[total:]
+                            return pkt
+                        break
+                    multiplier *= 128
+                    if multiplier > 128 ** 3:
+                        self.buf = b""
+                        return None
+            left = deadline - time.time()
+            if left <= 0 or not self.sock:
+                return None
+            ready, _, _ = select.select([self.sock], [], [], min(left, 1.0))
+            if not ready:
+                continue
+            try:
+                chunk = self.sock.recv(4096)
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            self.buf += chunk
+            self.last_io = time.time()
+
+    def poll(self, timeout=0.5):
+        if not self.sock:
+            return None
+        ready, _, _ = select.select([self.sock], [], [], timeout)
+        if ready:
+            try:
+                chunk = self.sock.recv(8192)
+            except OSError:
+                return None
+            if not chunk:
+                raise OSError("mqtt disconnected")
+            self.buf += chunk
+            self.last_io = time.time()
+        return self._recv_packet(timeout=0) if len(self.buf) >= 2 else None
+
+    def take_packets(self, timeout=0.4):
+        packets = []
+        first = self.poll(timeout)
+        if first:
+            packets.append(first)
+        while len(self.buf) >= 2:
+            nxt = self._recv_packet(timeout=0)
+            if not nxt:
+                break
+            packets.append(nxt)
+        return packets
+
+    def ping(self):
+        if self.sock:
+            self.sock.sendall(b"\xc0\x00")
+            self.last_io = time.time()
+
+    def subscribe(self, topic):
+        pid = self._next_id()
+        body = struct.pack("!H", pid) + mqtt_str(topic) + b"\x01"
+        self.sock.sendall(b"\x82" + encode_remaining(len(body)) + body)
+        self.last_io = time.time()
+
+    def publish(self, topic, payload, qos=0):
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        if qos:
+            pid = self._next_id()
+            body = mqtt_str(topic) + struct.pack("!H", pid) + data
+            header = 0x32
+        else:
+            body = mqtt_str(topic) + data
+            header = 0x30
+        self.sock.sendall(bytes([header]) + encode_remaining(len(body)) + body)
+        self.last_io = time.time()
+
+    def handle_puback_or_publish(self, pkt):
+        if not pkt:
+            return None
+        kind = pkt[0] & 0xF0
+        if kind == 0x40:  # PUBACK
+            return None
+        if kind == 0xD0:  # PINGRESP
+            return None
+        if kind == 0x90:  # SUBACK
+            return None
+        if kind != 0x30:
+            return None
+        qos = (pkt[0] >> 1) & 0x03
+        idx = 1
+        while pkt[idx] & 0x80:
+            idx += 1
+        idx += 1
+        tlen = struct.unpack("!H", pkt[idx:idx + 2])[0]
+        idx += 2
+        topic = pkt[idx:idx + tlen].decode("utf-8", "replace")
+        idx += tlen
+        if qos:
+            pid = struct.unpack("!H", pkt[idx:idx + 2])[0]
+            idx += 2
+            try:
+                self.sock.sendall(b"\x40\x02" + struct.pack("!H", pid))
+            except OSError:
+                pass
+        payload = pkt[idx:]
+        return topic, payload
+
+
+def lookup_ipv4(host):
+    """OpenWrt python3.13 often lacks the idna codec, so avoid getaddrinfo()."""
+    if host.replace(".", "").isdigit():
+        return host
+    try:
+        out = subprocess.check_output(
+            ["nslookup", host], stderr=subprocess.STDOUT, text=True, timeout=8)
+    except Exception as exc:
+        raise OSError("dns failed for %s: %s" % (host, exc))
+    ips = []
+    for line in out.splitlines():
+        line = line.strip()
+        key, _, rest = line.partition(":")
+        if key.strip().lower() != "address" or not rest:
+            continue
+        ip = rest.strip().split()[0].split("%")[0]
+        if ip.count(".") == 3 and not ip.startswith("127."):
+            ips.append(ip)
+    if not ips:
+        raise OSError("no A record for %s" % host)
+    return ips[-1]
+
+
+def dumps(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def presence_ts():
+    return int(time.time())
+
+
+def reply_ts():
+    return "%.6f" % time.time()
+
+
+def cellmgr_status():
+    try:
+        raw = subprocess.check_output(["/usr/sbin/cellmgr", "status"], stderr=subprocess.DEVNULL, timeout=25)
+        return json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return {}
+
+
+def sim_slot(status):
+    slot = ((status.get("sim") or {}).get("slot")) or ""
+    return SLOT_MAP.get(slot, ("", ""))
+
+
+def signal_item(status, device_id):
+    modem = status.get("modem") or {}
+    sim = status.get("sim") or {}
+    net = status.get("network") or {}
+    sig = status.get("signal") or {}
+    wan = status.get("wan") or {}
+    online = 1 if wan.get("up") else 0
+    rsrp = sig.get("rsrp_dbm")
+    rssi = sig.get("rssi_dbm")
+    strength = rsrp if rsrp is not None else rssi
+    simtype, simno = sim_slot(status)
+    rat = net.get("rat") or ""
+    if str(rat).upper() in ("NR", "5G"):
+        mode = "NR SA"
+        nrcap = "1"
+    elif str(rat).upper() in ("LTE", "4G"):
+        mode = "LTE"
+        nrcap = "0"
+    else:
+        mode = net.get("rat_label") or rat
+        nrcap = "1" if "5G" in str(net.get("rat_label") or "") else "0"
+    band = str(net.get("band_num") or net.get("band") or "").lstrip("nNB")
+    return {
+        "name": "cpe1",
+        "cpeno": 1,
+        "hwid": modem.get("model") or "MT5700M-CN",
+        "real_name": modem.get("model") or "MT5700M-CN",
+        "driver": modem.get("manufacturer") or "TD Tech",
+        "mode": mode,
+        "isp": sim.get("plmn") or net.get("plmn") or "",
+        "sim_isp": net.get("carrier") or "",
+        "operator_name": net.get("carrier") or "",
+        "imei": modem.get("imei") or "",
+        "imsi": sim.get("imsi") or "",
+        "iccid": sim.get("iccid") or "",
+        "cell": net.get("cell_id") or "",
+        "cellid": net.get("cell_id") or "",
+        "pci": net.get("pci") or "",
+        "dl_pci": net.get("pci") or "",
+        "earfcn": net.get("arfcn") or "",
+        "dl_fcn": net.get("arfcn") or "",
+        "tac": net.get("tac") or "",
+        "band": band,
+        "band_count": 1 if band else 0,
+        "rsrp": rsrp if rsrp is not None else "",
+        "rsrq": sig.get("rsrq_db") if sig.get("rsrq_db") is not None else "",
+        "sinr": sig.get("sinr_db") if sig.get("sinr_db") is not None else "",
+        "rssi": rssi if rssi is not None else "",
+        "nrcap": nrcap,
+        "model_temp": modem.get("temp_c") if modem.get("temp_c") is not None else "",
+        "cpin": sim.get("cpin") or "",
+        "CPIN": "0" if (sim.get("cpin") or "").upper() == "READY" else (sim.get("cpin") or ""),
+        "simtype": simtype,
+        "simno": simno,
+        "simcount": "3",
+        "switchmode": "1",
+        "online": online,
+        "netlink": online,
+        "status": 0 if online else 1,
+        "gateway_if": 1,
+        "signal": strength if strength is not None else -999,
+        "signalStrength": strength if strength is not None else "",
+        "manufacturer": modem.get("manufacturer") or "TD Tech",
+        "interface": wan.get("device") or "eth2",
+        "id": device_id,
+    }
+
+
+def device_info(status, ident):
+    wan = status.get("wan") or {}
+    sim = status.get("sim") or {}
+    item = signal_item(status, ident["device_id"])
+    ipv4 = ""
+    addrs = wan.get("ipv4") or []
+    if addrs:
+        ipv4 = addrs[0]
+    info = {
+        "sversion": "luci-app-cellmgr-0.4.0",
+        "iccid": [[sim.get("iccid") or ""]],
+        "simid": [[""]],
+        "cpesel": [{
+            "mode": "1",
+            "cur": "1" if sim.get("slot") == "nano" else ("2" if sim.get("slot") == "esim2" else "3"),
+            "iccid": sim.get("iccid") or "",
+        }],
+        "ptype": "rt",
+        "vendor": "nradio",
+        "board": "C2000-MAX",
+        "name": ident.get("device_code") or "C2000-MAX",
+        "wifiauth": -1,
+        "wired_client": {"count": 0, "client": []},
+        "uptime": int(wan.get("uptime") or 0),
+        "id": ident["device_id"],
+        "oid": ident["device_id"],
+        "ifinfo": [],
+        "ipaddr": ipv4,
+        "radio": [],
+        "radiocnt": {"band2": 1, "band5": 1, "phy2": 1, "phy5": 1, "chlist": [], "skip_channels": [], "bwlist": []},
+        "client": [],
+        "uniq": reply_ts(),
+    }
+    if ident.get("device_code"):
+        info["device_code"] = ident["device_code"]
+    info["_signal"] = item
+    return info
+
+
+def kpcped_loop(stop):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", KPCPE_PORT))
+        sock.listen(8)
+        sock.settimeout(1.0)
+    except OSError as exc:
+        log("kpcped bind failed: %s" % exc)
+        return
+    log("kpcped listen :%d" % KPCPE_PORT)
+    while not stop.is_set():
+        try:
+            conn, _addr = sock.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            conn.sendall(b"OK\r\n")
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+    sock.close()
+
+
+class Reporter:
+    def __init__(self, ident):
+        self.ident = ident
+        self.mqtt = None
+        self.status = {}
+        self.status_at = 0
+        self.state = "starting"
+
+    def topic(self, event, reply=False):
+        mid = "kp/mosca/%s/" % self.ident["device_id"]
+        return mid + ("reply/" if reply else "") + event
+
+    def publish(self, event, payload, reply=False):
+        if self.mqtt is None:
+            return False
+        if isinstance(payload, dict) and "uniq" not in payload:
+            payload = dict(payload)
+            payload["uniq"] = presence_ts() if event in ("cpestatus", "status") else reply_ts()
+        self.mqtt.publish(self.topic(event, reply), payload, qos=1)
+        return True
+
+    def refresh_status(self, force=False):
+        if not force and time.time() - self.status_at < 20 and self.status:
+            return self.status
+        data = cellmgr_status()
+        if data:
+            self.status = data
+            self.status_at = time.time()
+        return self.status
+
+    def announce(self):
+        did = self.ident["device_id"]
+        self.publish("group_id", {"id": did + ":g1", "server_id": did})
+        self.publish("status", {"id": did, "uniq": presence_ts()})
+        self.publish("time", {"time": int(time.time())})
+        self.publish("cpestatus", {"uniq": presence_ts()})
+        info = device_info(self.refresh_status(True), self.ident)
+        signal = info.pop("_signal", None)
+        self.publish("device_info", info)
+        if signal:
+            self.publish("cpeinfo", {"list": [signal]})
+
+    def handle_event(self, event, payload):
+        event = (event or "").split("?")[0]
+        if event in ("reply",):
+            return
+        status = self.refresh_status(event in ("signal", "cpestatus", "status", "info", "device_info"))
+        item = signal_item(status, self.ident["device_id"]) if status else {}
+        if event in ("heartbeat",):
+            self.publish("heartbeat", {"errcode": "0", "code": "0"}, True)
+        elif event in ("signal", "cellular_record", "cpeinfo"):
+            self.publish("cpeinfo" if event == "cpestatus" else event, {
+                "id": self.ident["device_id"],
+                "errcode": "0",
+                "result": [item] if item else [{}],
+            }, True)
+        elif event in ("cpestatus",):
+            self.publish("cpeinfo", {"list": [item] if item else [""]}, True)
+        elif event in ("status", "device_info", "report", "config", "info"):
+            info = device_info(status, self.ident)
+            info.pop("_signal", None)
+            self.publish("device_info", info, True)
+        elif event in ("intstatus",):
+            wan = status.get("wan") or {}
+            addrs = wan.get("ipv4") or []
+            value = {"mode": "dhcp", "time": int(wan.get("uptime") or -1)}
+            if addrs:
+                value["ip"] = addrs[0]
+            self.publish("intinfo", value, True)
+        elif event in ("batstatus",):
+            self.publish("batinfo", {"percent": "-1", "charging": False}, True)
+
+    def on_message(self, topic, raw):
+        prefix = "kp/%s/" % self.ident["device_id"]
+        if not topic.startswith(prefix):
+            return
+        rest = topic[len(prefix):]
+        parts = [p for p in rest.split("/") if p]
+        if not parts or parts[0] in ("reply", "mosca"):
+            return
+        event = parts[1] if len(parts) > 1 else parts[0]
+        payload = {}
+        if raw:
+            try:
+                parsed = json.loads(raw.decode("utf-8", "replace"))
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except json.JSONDecodeError:
+                return
+        log("cloud request %s" % event)
+        self.handle_event(event, payload)
+
+    def loop(self):
+        did = self.ident["device_id"]
+        host = self.ident["broker"]
+        presence_iv = 2
+        status_iv = 30
+        report_iv = 300
+        while True:
+            try:
+                self.state = "connecting"
+                write_state({"state": self.state, "device_id": did, "broker": host,
+                             "device_code": self.ident.get("device_code") or ""})
+                log("connect %s as %s" % (host, did))
+                mqtt = MqttClient(host, did, USERNAME)
+                mqtt.connect()
+                self.mqtt = mqtt
+                mqtt.subscribe("kp/%s/#" % did)
+                self.state = "connected"
+                write_state({"state": self.state, "device_id": did, "broker": host,
+                             "device_code": self.ident.get("device_code") or "",
+                             "message": "mqtt connected"})
+                for _ in range(5):
+                    for pkt in mqtt.take_packets(0.2):
+                        msg = mqtt.handle_puback_or_publish(pkt)
+                        if msg:
+                            self.on_message(msg[0], msg[1])
+                self.announce()
+                next_presence = time.time()
+                next_status = time.time() + status_iv
+                next_report = time.time() + report_iv
+                next_ping = time.time() + 4
+                while True:
+                    for pkt in mqtt.take_packets(0.4):
+                        msg = mqtt.handle_puback_or_publish(pkt)
+                        if msg:
+                            self.on_message(msg[0], msg[1])
+                    now = time.time()
+                    if not cloud_enabled():
+                        log("cloud switch off, disconnect")
+                        mqtt.close()
+                        return
+                    ident_now = load_identity()
+                    if ident_now.get("device_id") != did:
+                        log("device id changed, reconnect")
+                        mqtt.close()
+                        return
+                    if now >= next_ping:
+                        mqtt.ping()
+                        next_ping = now + 4
+                    if now >= next_presence:
+                        self.publish("cpestatus", {"uniq": presence_ts()})
+                        next_presence = now + presence_iv
+                        write_state({"state": "connected", "device_id": did, "broker": host,
+                                     "device_code": self.ident.get("device_code") or "",
+                                     "last_presence": int(now), "message": "heartbeat"})
+                    if now >= next_status:
+                        self.publish("status", {"id": did, "uniq": presence_ts()})
+                        next_status = now + status_iv
+                    if now >= next_report:
+                        info = device_info(self.refresh_status(True), self.ident)
+                        signal = info.pop("_signal", None)
+                        self.publish("device_info", info)
+                        if signal:
+                            self.publish("cpeinfo", {"list": [signal]})
+                        next_report = now + report_iv
+            except Exception as exc:
+                self.mqtt = None
+                self.state = "retry"
+                write_state({"state": self.state, "device_id": did, "broker": host,
+                             "message": str(exc)})
+                log("mqtt error: %s" % exc)
+                if not cloud_enabled():
+                    return
+                time.sleep(5)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "identity":
+        print(dumps(load_identity()))
+        return
+    stop = threading.Event()
+    kpcpe_started = False
+    while True:
+        if not cloud_enabled():
+            stop.set()
+            kpcpe_started = False
+            ident = load_identity()
+            write_state({
+                "state": "disabled",
+                "device_id": ident.get("device_id") or "",
+                "broker": ident.get("broker") or "",
+                "device_code": ident.get("device_code") or "",
+                "message": "上报已关闭",
+            })
+            time.sleep(2)
+            continue
+        ident = load_identity()
+        if not ident.get("device_id") or not ident.get("broker"):
+            write_state({"state": "identity_error", "message": "no factory MAC / device id"})
+            log("identity unavailable")
+            time.sleep(10)
+            continue
+        if not kpcpe_started:
+            stop = threading.Event()
+            threading.Thread(target=kpcped_loop, args=(stop,), daemon=True).start()
+            kpcpe_started = True
+        Reporter(ident).loop()
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()

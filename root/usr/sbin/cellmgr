@@ -737,6 +737,7 @@ def cmd_status():
             "available_lte": LTE_BANDS_ALL,
         },
         "events": events,
+        "cloud": cloud_status(),
     }
     save_state({"last_slot": slot, "last_status_ts": time.time()})
     return data
@@ -979,12 +980,50 @@ def cmd_watchdog():
     return {"ok": True, "alive": False, "redial": True, "up": False}
 
 
+def cloud_status():
+    enabled = uci_get("cellmgr.main.cloud_enable", "0") == "1"
+    info = {
+        "enabled": enabled,
+        "state": "disabled" if not enabled else "stopped",
+        "device_id": "",
+        "broker": "",
+        "message": "",
+        "last_presence": 0,
+    }
+    try:
+        with open("/var/run/cellmgr-cloud.json", "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            info.update(saved)
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    info["enabled"] = enabled
+    if not enabled:
+        info["state"] = "disabled"
+        info["message"] = "上报已关闭"
+    return info
+
+
 def cmd_setcfg(key, value):
-    allowed = {"watchdog": ("0", "1"), "failover": ("0", "1")}
-    if key not in allowed or value not in allowed[key]:
-        return {"ok": False, "error": "invalid"}
-    uci_set("cellmgr.main." + key, value)
-    return {"ok": True, key: value}
+    allowed = {"watchdog": ("0", "1"), "failover": ("0", "1"), "cloud_enable": ("0", "1")}
+    if key in allowed:
+        if value not in allowed[key]:
+            return {"ok": False, "error": "invalid"}
+        uci_set("cellmgr.main." + key, value)
+        return {"ok": True, key: value}
+    if key == "cloud_id":
+        ident = value.strip().replace(":", "").replace("-", "").upper()
+        if ident and (len(ident) != 12 or any(c not in "0123456789ABCDEF" for c in ident)):
+            return {"ok": False, "error": "设备 ID 须为 12 位 MAC"}
+        uci_set("cellmgr.main.cloud_id", ident)
+        return {"ok": True, key: key, "value": ident}
+    if key == "cloud_code":
+        ident = value.strip()
+        if ident and (len(ident) > 64 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for c in ident)):
+            return {"ok": False, "error": "设备码无效"}
+        uci_set("cellmgr.main.cloud_code", ident)
+        return {"ok": True, key: key, "value": ident}
+    return {"ok": False, "error": "invalid"}
 
 
 def busy_begin(tag):

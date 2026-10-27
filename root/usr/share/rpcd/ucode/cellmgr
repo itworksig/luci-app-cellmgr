@@ -76,7 +76,19 @@ const methods = {
 		call: function(request) {
 			const key = request.args.key;
 			const value = request.args.value;
-			if (key != 'watchdog' && key != 'failover')
+			if (key == 'watchdog' || key == 'failover' || key == 'cloud_enable') {
+				if (value != '0' && value != '1')
+					return { ok: false, error: 'invalid value' };
+			}
+			else if (key == 'cloud_id') {
+				if (value != '' && !match(value, regexp('^[0-9A-Fa-f:]{12,17}$')))
+					return { ok: false, error: 'invalid id' };
+			}
+			else if (key == 'cloud_code') {
+				if (value != '' && !match(value, regexp('^[A-Za-z0-9._-]{1,64}$')))
+					return { ok: false, error: 'invalid code' };
+			}
+			else
 				return { ok: false, error: 'invalid key' };
 			return run('setcfg ' + shellquote(key) + ' ' + shellquote(value));
 		}

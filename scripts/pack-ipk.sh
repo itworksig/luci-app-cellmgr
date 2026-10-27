@@ -30,6 +30,7 @@ rsync -a --exclude '.DS_Store' --exclude '._*' "$ROOT/htdocs/" "$DATA/www/"
 chmod 755 \
 	"$DATA/usr/sbin/cellmgr" \
 	"$DATA/usr/sbin/cellmgr-watch" \
+	"$DATA/usr/sbin/cellmgr-cloud" \
 	"$DATA/etc/init.d/cellmgr" \
 	"$DATA/etc/uci-defaults/80-luci-app-cellmgr"
 
